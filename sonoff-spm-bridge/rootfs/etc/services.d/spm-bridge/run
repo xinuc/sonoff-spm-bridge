@@ -1,0 +1,4 @@
+#!/usr/bin/with-contenv bashio
+
+bashio::log.info "Starting Sonoff SPM Bridge..."
+exec python3 /app/main.py
