@@ -3,3 +3,4 @@ __pycache__/
 *.pyo
 .claude/
 DESIGN.md
+.DS_Store
