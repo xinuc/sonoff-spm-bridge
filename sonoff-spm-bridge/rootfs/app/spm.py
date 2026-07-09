@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Callable, Coroutine
 
 import aiohttp
-from aiohttp import web
 
 _LOG = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ class SPMClient:
         self._base = f"http://{host}:{_SPM_PORT}"
         self._session: aiohttp.ClientSession | None = None
         self._consecutive_failures = 0
-        self._webhook_runner: web.AppRunner | None = None
+        self._webhook_server: asyncio.AbstractServer | None = None
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -257,39 +257,99 @@ class SPMClient:
     # -- Webhook server --------------------------------------------
 
     async def start_webhook_server(self, port: int, callback: DataCallback) -> None:
-        """Start an aiohttp server on ``0.0.0.0:{port}`` that receives
-        data pushes from SPM and invokes *callback* for each."""
-        async def handle(request: web.Request) -> web.Response:
+        """Start a raw asyncio HTTP server on ``0.0.0.0:{port}``.
+
+        The Sonoff SPM pushes data with a minimal, non-compliant HTTP/1.0
+        request that omits the ``Host`` header, which aiohttp's strict
+        parser rejects with a 400 before any handler runs.  This
+        hand-rolled parser tolerates it: read the request, extract the
+        JSON body, invoke *callback*, and always answer ``200 ok``.
+        """
+        async def handle_client(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+        ) -> None:
             try:
-                body = await request.json(content_type=None)
+                await self._handle_webhook_request(reader, writer, callback)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError,
+                    asyncio.LimitOverrunError):
+                _LOG.debug("Webhook request incomplete or timed out")
             except Exception:
-                _LOG.warning("Webhook received non-JSON payload")
-                return web.Response(status=400, text="bad request")
+                _LOG.exception("Webhook request handling error")
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
-            result = _parse_data(body)
-            if not result or not result.channels:
-                _LOG.debug("Webhook payload contained no channel data")
-                return web.Response(text="ok")
-
-            try:
-                await callback(result)
-            except Exception:
-                _LOG.exception("Error in webhook data callback")
-
-            return web.Response(text="ok")
-
-        app = web.Application()
-        app.router.add_post("/{path:.*}", handle)
-        self._webhook_runner = web.AppRunner(app)
-        await self._webhook_runner.setup()
-        site = web.TCPSite(self._webhook_runner, "0.0.0.0", port)
-        await site.start()
+        self._webhook_server = await asyncio.start_server(
+            handle_client, "0.0.0.0", port,
+        )
         _LOG.info("Webhook server listening on port %d", port)
+
+    @staticmethod
+    async def _handle_webhook_request(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        callback: DataCallback,
+    ) -> None:
+        """Parse one HTTP request, dispatch its JSON body, and reply 200."""
+        # Read headers (everything up to the blank line).
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
+
+        content_length = 0
+        for line in head.split(b"\r\n")[1:]:
+            name, sep, value = line.partition(b":")
+            if sep and name.strip().lower() == b"content-length":
+                try:
+                    content_length = int(value.strip())
+                except ValueError:
+                    content_length = 0
+                break
+
+        # Read the body: use Content-Length if present, else until EOF.
+        if content_length > 0:
+            body = await asyncio.wait_for(
+                reader.readexactly(content_length), timeout=10,
+            )
+        else:
+            body = await asyncio.wait_for(reader.read(65536), timeout=10)
+
+        if body:
+            try:
+                payload = json.loads(body.decode("utf-8", "replace"))
+            except json.JSONDecodeError:
+                _LOG.warning("Webhook received non-JSON payload")
+                payload = None
+
+            if isinstance(payload, dict):
+                result = _parse_data(payload)
+                if result and result.channels:
+                    try:
+                        await callback(result)
+                    except Exception:
+                        _LOG.exception("Error in webhook data callback")
+                else:
+                    _LOG.debug("Webhook payload contained no channel data")
+
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: 2\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+            b"ok"
+        )
+        await writer.drain()
 
     async def stop_webhook_server(self) -> None:
         """Stop the webhook server if running."""
-        if self._webhook_runner:
-            await self._webhook_runner.cleanup()
+        if self._webhook_server:
+            self._webhook_server.close()
+            try:
+                await self._webhook_server.wait_closed()
+            except Exception:
+                pass
 
     # -- Polling ---------------------------------------------------
 
