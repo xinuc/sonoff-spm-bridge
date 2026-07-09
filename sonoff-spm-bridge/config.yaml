@@ -1,6 +1,6 @@
 name: "Sonoff SPM Bridge"
 description: "Bridge Sonoff SPM power meters to Home Assistant via MQTT"
-version: "1.0.2"
+version: "1.0.3"
 slug: "sonoff_spm_bridge"
 url: "https://github.com/xinuc/sonoff-spm-bridge"
 arch:

@@ -15,6 +15,13 @@ _LOG = logging.getLogger(__name__)
 _SPM_PORT = 8081
 _TIMEOUT = aiohttp.ClientTimeout(connect=10, total=30)
 
+# The SPM is a small embedded device whose HTTP API returns {"error": 400}
+# when hit with too many requests too quickly.  Pace webhook registrations
+# and retry the transient rejections.
+_MONITOR_REQUEST_GAP = 0.4   # seconds between consecutive monitor requests
+_MONITOR_RETRIES = 4         # attempts per outlet before giving up
+_MONITOR_RETRY_DELAY = 1.0   # base backoff between retries (grows per attempt)
+
 
 # ------------------------------------------------------------------
 # Data types
@@ -233,26 +240,53 @@ class SPMClient:
         if outlets is None:
             outlets = [0, 1, 2, 3]
         all_ok = True
-        for outlet in outlets:
-            resp = await self._post("/zeroconf/monitor", {
-                "deviceid": device_id,
-                "data": {
-                    "url": f"http://{addon_ip}",
-                    "port": port,
-                    "subDevId": sub_device_id,
-                    "outlet": outlet,
-                    "time": duration,
-                },
-            })
-            ok = resp is not None and resp.get("error") == 0
+        for i, outlet in enumerate(outlets):
+            if i:
+                # Pace requests so the device isn't overwhelmed.
+                await asyncio.sleep(_MONITOR_REQUEST_GAP)
+            ok = await self._register_one(
+                device_id, sub_device_id, addon_ip, port, outlet, duration,
+            )
             if not ok:
-                _LOG.warning("Webhook registration failed for %s outlet %d: %s",
-                             sub_device_id, outlet, resp)
                 all_ok = False
         if all_ok:
             _LOG.info("Webhook registered for %s outlets %s (duration %ds)",
                       sub_device_id, outlets, duration)
         return all_ok
+
+    async def _register_one(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        addon_ip: str,
+        port: int,
+        outlet: int,
+        duration: int,
+    ) -> bool:
+        """Register a single outlet's webhook, retrying transient failures."""
+        payload = {
+            "deviceid": device_id,
+            "data": {
+                "url": f"http://{addon_ip}",
+                "port": port,
+                "subDevId": sub_device_id,
+                "outlet": outlet,
+                "time": duration,
+            },
+        }
+        last_resp: dict | None = None
+        for attempt in range(1, _MONITOR_RETRIES + 1):
+            resp = await self._post("/zeroconf/monitor", payload)
+            if resp is not None and resp.get("error") == 0:
+                return True
+            last_resp = resp
+            if attempt < _MONITOR_RETRIES:
+                await asyncio.sleep(_MONITOR_RETRY_DELAY * attempt)
+        _LOG.warning(
+            "Webhook registration failed for %s outlet %d after %d attempts: %s",
+            sub_device_id, outlet, _MONITOR_RETRIES, last_resp,
+        )
+        return False
 
     # -- Webhook server --------------------------------------------
 
