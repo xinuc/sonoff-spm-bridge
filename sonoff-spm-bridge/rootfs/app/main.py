@@ -122,19 +122,11 @@ class SPMBridge:
         # 7. Query initial switch states
         await self._fetch_initial_switch_states()
 
-        # 8. Determine our IP and register webhooks (all outlets per sub-device)
-        poll_interval = self._config.get("poll_interval", 60)
-        webhook_duration = min(poll_interval * 3, 3600)
+        # 8. Determine our IP (the SPM pushes webhook data here).  Actual
+        # monitor registration is driven by the rotation loop below.
         self._addon_ip = _get_local_ip(self._config["spm_host"])
-        if self._addon_ip:
-            webhook_port = self._config.get("webhook_port", 8080)
-            for sub_id in self._sub_device_ids:
-                await self._spm.register_webhook(
-                    self._device_id, sub_id, self._addon_ip, webhook_port,
-                    outlets=_DEFAULT_CHANNELS, duration=webhook_duration,
-                )
-        else:
-            _LOG.warning("Could not determine addon IP — webhook registration skipped")
+        if not self._addon_ip:
+            _LOG.warning("Could not determine addon IP — webhook data cannot be received")
 
         # 9. Start webhook server
         await self._spm.start_webhook_server(
@@ -158,18 +150,19 @@ class SPMBridge:
             asyncio.create_task(self._mqtt_listen_task(), name="mqtt_listen"),
         ]
 
-        # Webhook re-registration loop (keep-alive)
+        # Rotating subscription poller: the SPM only streams the most-recently
+        # registered monitor, so cycle a single active subscription across
+        # every (sub-device, outlet) to refresh all channels in turn.
         if self._addon_ip:
             tasks.append(asyncio.create_task(
-                self._spm.poll_loop(
+                self._spm.rotate_loop(
                     device_id=self._device_id,
                     sub_device_ids=self._sub_device_ids,
                     addon_ip=self._addon_ip,
                     port=self._config.get("webhook_port", 8080),
-                    interval=poll_interval,
                     channels=_DEFAULT_CHANNELS,
                 ),
-                name="webhook_keepalive",
+                name="webhook_rotation",
             ))
 
         await self._shutdown_event.wait()
@@ -237,8 +230,8 @@ class SPMBridge:
 
     async def _on_spm_data(self, data: SubDeviceData) -> None:
         """Process incoming SPM data from webhook pushes."""
-        _LOG.debug("Webhook data for %s: %d channel(s)",
-                   data.sub_device_id, len(data.channels))
+        _LOG.debug("Webhook data for %s: outlet(s) %s",
+                   data.sub_device_id, [ch.outlet for ch in data.channels])
         for ch in data.channels:
             channel_key = f"{data.sub_device_id}_ch{ch.outlet}"
             energy_kwh = self._energy.update(channel_key, ch.power)

@@ -18,9 +18,14 @@ _TIMEOUT = aiohttp.ClientTimeout(connect=10, total=30)
 # The SPM is a small embedded device whose HTTP API returns {"error": 400}
 # when hit with too many requests too quickly.  Pace webhook registrations
 # and retry the transient rejections.
-_MONITOR_REQUEST_GAP = 0.4   # seconds between consecutive monitor requests
 _MONITOR_RETRIES = 4         # attempts per outlet before giving up
 _MONITOR_RETRY_DELAY = 1.0   # base backoff between retries (grows per attempt)
+
+# The SPM only streams data for the most-recently-registered monitor: each
+# /zeroconf/monitor registration evicts the previous one.  We therefore
+# rotate a single active subscription across every channel, dwelling on
+# each long enough to receive a few pushes before advancing.
+_ROTATE_DWELL_SECONDS = 3.0
 
 
 # ------------------------------------------------------------------
@@ -222,38 +227,6 @@ class SPMClient:
                     result[sub_id] = switches
         return result
 
-    async def register_webhook(
-        self,
-        device_id: str,
-        sub_device_id: str,
-        addon_ip: str,
-        port: int,
-        outlets: list[int] | None = None,
-        duration: int = 300,
-    ) -> bool:
-        """Ask SPM to push monitor data to our webhook server.
-
-        Registers each *outlet* individually.  *duration* is how many
-        seconds the SPM will keep pushing before the registration expires
-        (max 3600).  Must be re-registered before it expires.
-        """
-        if outlets is None:
-            outlets = [0, 1, 2, 3]
-        all_ok = True
-        for i, outlet in enumerate(outlets):
-            if i:
-                # Pace requests so the device isn't overwhelmed.
-                await asyncio.sleep(_MONITOR_REQUEST_GAP)
-            ok = await self._register_one(
-                device_id, sub_device_id, addon_ip, port, outlet, duration,
-            )
-            if not ok:
-                all_ok = False
-        if all_ok:
-            _LOG.info("Webhook registered for %s outlets %s (duration %ds)",
-                      sub_device_id, outlets, duration)
-        return all_ok
-
     async def _register_one(
         self,
         device_id: str,
@@ -385,35 +358,48 @@ class SPMClient:
             except Exception:
                 pass
 
-    # -- Polling ---------------------------------------------------
+    # -- Rotating subscription poller ------------------------------
 
-    async def poll_loop(
+    async def rotate_loop(
         self,
         device_id: str,
         sub_device_ids: list[str],
         addon_ip: str,
         port: int,
-        interval: int = 60,
         channels: list[int] | None = None,
+        dwell: float = _ROTATE_DWELL_SECONDS,
     ) -> None:
-        """Periodically re-register webhooks as a keep-alive.
+        """Rotate a single active monitor subscription across all channels.
 
-        The SPM has no documented polling endpoint for current readings.
-        Data arrives exclusively via webhook pushes.  This loop ensures
-        the webhook registration stays active by re-registering before
-        the monitoring duration expires.
-
-        *interval* is how often we re-register (seconds).  The monitoring
-        duration sent to the SPM is ``interval * 3`` to provide overlap.
+        The SPM has no polling endpoint for readings — data arrives only via
+        webhook pushes — and it streams only the most-recently-registered
+        monitor (a new registration evicts the previous one).  So we register
+        one ``(sub-device, outlet)`` target at a time, dwell briefly to
+        receive its pushes, then advance to the next.  One full pass refreshes
+        every channel; the cycle then repeats forever.
         """
-        duration = min(interval * 3, 3600)
+        if channels is None:
+            channels = [0, 1, 2, 3]
+        targets = [(sub, outlet) for sub in sub_device_ids for outlet in channels]
+        if not targets:
+            _LOG.warning("No monitor targets to rotate")
+            return
+
+        # Registration must outlive the dwell so it doesn't self-expire before
+        # the next target replaces it.
+        duration = max(int(dwell * 3), 15)
+        _LOG.info(
+            "Rotating monitor subscription across %d target(s), ~%.0fs per cycle",
+            len(targets), dwell * len(targets),
+        )
+        idx = 0
         while True:
-            await asyncio.sleep(interval)
-            for sub_id in sub_device_ids:
-                await self.register_webhook(
-                    device_id, sub_id, addon_ip, port,
-                    outlets=channels, duration=duration,
-                )
+            sub_id, outlet = targets[idx]
+            await self._register_one(
+                device_id, sub_id, addon_ip, port, outlet, duration,
+            )
+            await asyncio.sleep(dwell)
+            idx = (idx + 1) % len(targets)
 
     # -- Internal --------------------------------------------------
 
