@@ -1,6 +1,6 @@
 name: "Sonoff SPM Bridge"
 description: "Bridge Sonoff SPM power meters to Home Assistant via MQTT"
-version: "1.0.0"
+version: "1.0.1"
 slug: "sonoff_spm_bridge"
 url: "https://github.com/xinuc/sonoff-spm-bridge"
 arch:
@@ -10,6 +10,10 @@ arch:
   - armv7
   - i386
 init: false
+# host_network is required so the SPM (on the physical LAN) can push webhook
+# data back to us. In HA's default bridged network the add-on only has an
+# internal Docker IP (172.30.x.x) which the SPM cannot route to.
+host_network: true
 ports:
   "8080/tcp": 8080
 ports_description:

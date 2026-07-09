@@ -237,6 +237,8 @@ class SPMBridge:
 
     async def _on_spm_data(self, data: SubDeviceData) -> None:
         """Process incoming SPM data from webhook pushes."""
+        _LOG.debug("Webhook data for %s: %d channel(s)",
+                   data.sub_device_id, len(data.channels))
         for ch in data.channels:
             channel_key = f"{data.sub_device_id}_ch{ch.outlet}"
             energy_kwh = self._energy.update(channel_key, ch.power)
