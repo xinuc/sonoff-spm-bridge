@@ -130,8 +130,11 @@ class MQTTBridge:
         # Parent device (SPM-Main) — referenced by via_device
         main_device_id = f"spm_{device_id}"
 
-        # Sub-device as its own HA device
-        sub_short = sub_device_id[-6:] if len(sub_device_id) > 6 else sub_device_id
+        # Sub-device as its own HA device.  Use the *front* of the ID for the
+        # short name: sub-devices often share a trailing model/batch suffix
+        # (e.g. two ending in "373439"), so the last chars aren't unique — the
+        # distinguishing part is at the start.
+        sub_short = sub_device_id[:6] if len(sub_device_id) > 6 else sub_device_id
         device_block = {
             "identifiers": [f"spm_{device_id}_{sub_device_id}"],
             "name": f"SPM Module {sub_short}",
